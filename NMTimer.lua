@@ -1,5 +1,5 @@
 -- =============================================================================
--- NMTimer.lua : NM の再出現タイマー (v0.4.0)
+-- NMTimer.lua : NM の再出現タイマー (v0.5.1)
 -- =============================================================================
 -- 【目的】
 -- メイジャンの試練 (エンピリアン武器) に出る NM などが倒されたとき、その時刻と場所を覚え、
@@ -31,7 +31,7 @@
 
 _addon.name     = "NMTimer"
 _addon.author   = "hikaruoshino"
-_addon.version  = "0.4.0"
+_addon.version  = "0.5.1"
 _addon.commands = {"nmtimer", "nmt"}
 
 local config = require("config")
@@ -850,6 +850,94 @@ local function utf8_name(raw)
     return raw
 end
 
+-- //nmt scan : 敵の一覧 (windower.ffxi.get_mob_array) を読むだけの調べもの。
+-- 姿が見えない敵 (アビセアンなど) が一覧に載っていて、名前と座標が読めるかを確かめる。
+--   //nmt scan           : 登録されている NM のうち、今のエリアの名前に一致するもの (見えなくても)
+--   //nmt scan all        : 描画されていない (valid_target が偽の) 敵をすべて (名前が空の敵も含む)
+--   //nmt scan near [m]   : 自分から m ヤルム以内の敵をすべて (見えるか・名前があるかに関係なく。初期値 60)
+--   //nmt scan <名前>     : 名前の一部に一致する敵 (大文字小文字は区別しない)
+-- 結果は data/scan.log にも追記する (あとで調べるため)
+local SCAN_LIMIT = 25
+local function cmd_scan(args)
+    local text = args[1] and table.concat(args, " "):lower() or nil
+    local mode = "nm"
+    local near_sq
+    if text == "all" then mode = "hidden"
+    elseif args[1] and args[1]:lower() == "near" then
+        mode = "near"
+        local m = tonumber(args[2]) or 60
+        near_sq = m * m
+    elseif text then mode = "text" end
+    local array = windower.ffxi.get_mob_array() or {}
+    local me = windower.ffxi.get_mob_by_target("me") or {}
+    local found, total, hidden, nameless = {}, 0, 0, 0
+    for _, mob in pairs(array) do
+        if type(mob) == "table" and mob.is_npc ~= false then
+            total = total + 1
+            if mob.valid_target == false then hidden = hidden + 1 end
+            local has_name = mob.name and mob.name ~= ""
+            if not has_name then nameless = nameless + 1 end
+            local hit = false
+            if mode == "hidden" then
+                hit = mob.valid_target == false
+            elseif mode == "near" then
+                hit = (mob.distance or math.huge) <= near_sq
+            elseif has_name then
+                local l = mob.name:lower()
+                if mode == "text" then
+                    hit = l:find(text, 1, true) ~= nil
+                else
+                    for _, e in ipairs(name_index[l] or {}) do
+                        if zone_sets[e.key][current_zone] then hit = true end
+                    end
+                end
+            end
+            if hit then found[#found + 1] = mob end
+        end
+    end
+    table.sort(found, function(a, b) return (a.distance or math.huge) < (b.distance or math.huge) end)
+
+    local lines = {}
+    lines[#lines + 1] = string.format("[NMTimer scan] %s ID %d / 敵の一覧 %d 体 (うち描画されていない %d 体・名前なし %d 体) / 一致 %d 体",
+        zone_label(current_zone), current_zone, total, hidden, nameless, #found)
+    if me.x then
+        lines[#lines + 1] = string.format("  自分: X %.1f Y %.1f Z %.1f 向き %s", me.x, me.y or 0, me.z or 0, tostring(me.heading))
+    end
+    for i, mob in ipairs(found) do
+        if i > SCAN_LIMIT then
+            lines[#lines + 1] = string.format("  …ほか %d 体 (多いので省略。名前で絞れます: //nmt scan <名前>)", #found - SCAN_LIMIT)
+            break
+        end
+        lines[#lines + 1] = string.format("  %s ID %s 距離 %s X %s Y %s Z %s 描画ターゲット可=%s 状態=%s HP=%s%%",
+            (mob.name and mob.name ~= "") and utf8_name(mob.name) or "(名前なし)", tostring(mob.id),
+            mob.distance and string.format("%.1fm", math.sqrt(mob.distance)) or "?",
+            mob.x and string.format("%.1f", mob.x) or "?", mob.y and string.format("%.1f", mob.y) or "?",
+            mob.z and string.format("%.1f", mob.z) or "?",
+            tostring(mob.valid_target), tostring(mob.status), tostring(mob.hpp))
+    end
+    if #found == 0 then
+        lines[#lines + 1] = "  一致する敵は、敵の一覧にありません。"
+        if mode == "nm" then lines[#lines + 1] = "  (見えない NM が一覧に載っていない可能性があります。ジェイドで光った方向の近くで、もう一度試してください)" end
+    else
+        -- 最初の 1 体の、一覧で読める項目を全部出す (どんな項目が使えるかを調べるため)
+        local keys = {}
+        for k, v in pairs(found[1]) do
+            if type(v) ~= "table" and type(v) ~= "function" then keys[#keys + 1] = tostring(k) .. "=" .. tostring(v) end
+        end
+        table.sort(keys)
+        lines[#lines + 1] = "  項目 (先頭の 1 体): " .. table.concat(keys, ", ")
+    end
+    for _, line in ipairs(lines) do chat(line, 207) end
+    ensure_dir()
+    local f = io.open(DATA_DIR .. "scan.log", "a")
+    if f then
+        f:write(os.date("%Y-%m-%d %H:%M:%S") .. "\n")
+        for _, line in ipairs(lines) do f:write(line .. "\n") end
+        f:write("\n")
+        f:close()
+    end
+end
+
 local function print_help()
     chat("[NMTimer] //nmt list [all]        : 今のエリア(または全部)の NM の一覧")
     chat("[NMTimer] //nmt off/on <NM>       : 追跡をやめる / 再開する (HUD から消える)")
@@ -861,6 +949,7 @@ local function print_help()
     chat("[NMTimer] //nmt clear [NM]         : 記録を消す")
     chat("[NMTimer] //nmt ph                : ターゲットした敵を PH に加える (何体でも)。ph list / ph del [ID] / ph clear <NM>")
     chat("[NMTimer] //nmt phtime <NM> <分>   : PH の再湧き時間を決める (reset で実測に戻す)")
+    chat("[NMTimer] //nmt scan [all|near [m]|名前] : 敵の一覧を調べる (見えない NM が一覧にあるか。読むだけ)")
     chat("[NMTimer] //nmt lead <分>          : 出られる何分前に知らせるか (0 で無し)")
     chat("[NMTimer] //nmt sound|chat|hud|coord on|off, //nmt pos X Y, //nmt size N, //nmt expire <分>")
     chat("[NMTimer] //nmt status             : 今の記録  /  //nmt debug : 倒れた敵の名前を表示")
@@ -1044,6 +1133,9 @@ windower.register_event("addon command", function(cmd, ...)
                 end
                 save_user()
             end
+
+        elseif cmd == "scan" then
+            cmd_scan(args)
 
         elseif cmd == "phtime" then
             local e, rest = need_entry(args, "//nmt phtime <NM> <分>")
