@@ -1,5 +1,5 @@
 -- =============================================================================
--- NMTimer.lua : NM の再出現タイマー (v0.5.1)
+-- NMTimer.lua : NM の再出現タイマー (v0.5.2)
 -- =============================================================================
 -- 【目的】
 -- メイジャンの試練 (エンピリアン武器) に出る NM などが倒されたとき、その時刻と場所を覚え、
@@ -31,7 +31,7 @@
 
 _addon.name     = "NMTimer"
 _addon.author   = "hikaruoshino"
-_addon.version  = "0.5.1"
+_addon.version  = "0.5.2"
 _addon.commands = {"nmtimer", "nmt"}
 
 local config = require("config")
@@ -63,7 +63,7 @@ local SOUND_FILE = windower.addon_path .. "sounds/ready.wav"
 
 local DEAD_STATUS = {[2] = true, [3] = true}   -- 敵の状態: 2 / 3 = 倒れた (BanishgaPull と同じ扱い)
 local SIGHT_MIN_SEC = 60                       -- 倒してからこれより早く現れたものは再出現とみなさない
-local PH_NEAR_SQ = 50 * 50                     -- PH の討伐を覚える範囲 (自分から 50 ヤーム。距離は 2 乗で届く。//nmt ph で指定した PH には使わない)
+local PH_NEAR_SQ = 50 * 50                     -- PH の討伐を覚える範囲 (自分から 50 ヤルム。距離は 2 乗で届く。//nmt ph で指定した PH には使わない)
 local PH_SIGHT_MIN_SEC = 30                    -- PH を倒してからこれより早く現れたものは再湧きとみなさない
 local PH_SLOT_KEEP_SEC = 3 * 3600              -- PH の記録を残す時間 (これを過ぎたら実測にも使わない)
 local REFRESH_SEC = 0.5
@@ -527,7 +527,7 @@ local function describe(rec, e, now)
         if rec.zone == current_zone then
             local me = windower.ffxi.get_mob_by_target("me")
             if me and me.x and me.y then
-                where = where .. string.format(" 距離%dm", math.floor(math.sqrt((me.x - rec.x) ^ 2 + (me.y - rec.y) ^ 2) + 0.5))
+                where = where .. string.format(" 距離%dYm", math.floor(math.sqrt((me.x - rec.x) ^ 2 + (me.y - rec.y) ^ 2) + 0.5))
             end
         end
         where = where .. ")"
@@ -910,7 +910,7 @@ local function cmd_scan(args)
         end
         lines[#lines + 1] = string.format("  %s ID %s 距離 %s X %s Y %s Z %s 描画ターゲット可=%s 状態=%s HP=%s%%",
             (mob.name and mob.name ~= "") and utf8_name(mob.name) or "(名前なし)", tostring(mob.id),
-            mob.distance and string.format("%.1fm", math.sqrt(mob.distance)) or "?",
+            mob.distance and string.format("%.1fYm", math.sqrt(mob.distance)) or "?",
             mob.x and string.format("%.1f", mob.x) or "?", mob.y and string.format("%.1f", mob.y) or "?",
             mob.z and string.format("%.1f", mob.z) or "?",
             tostring(mob.valid_target), tostring(mob.status), tostring(mob.hpp))
