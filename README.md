@@ -1,7 +1,8 @@
 # NMTimer (v0.5.2)
 
 **FFXI（Windower 4 用） NM の再出現タイマー**
-n[English edition](https://github.com/hikaruoshino/NMTimer-EN)
+
+[English edition](https://github.com/hikaruoshino/NMTimer-EN)
 
 メイジャンの試練（エンピリアン武器の素材づくり）に出てくる NM が倒された時刻と場所を覚えて、「次に出られるまで」を画面に出すアドオンです。先に誰かに倒されて間に合わなかった NM も、倒された時刻と場所が分かれば次を狙えます。
 
