@@ -120,3 +120,9 @@ MIT License
 * **v0.3.0 (2026-10-16)** PH の再湧き時間を自動で測る機能を追加（同じ ID の敵が再び現れた時刻との差。5 回分の中央値を使う）。`//nmt ph`（対象の PH を覚える）と `//nmt phtime`（自分で決める）を追加。すべての PH を記録するようにした（これまでは再湧き時間が分かっているものだけ）。
 * **v0.2.0 (2026-10-16)** 同梱の NM を 73 体に増やした（メイジャンの各武器の最初の段階の NM 50 体・Golden Bat・Barbastelle を追加）。記録されない理由を //nmt debug で表示。座標表示の //nmt coord。自分で足した NM の記録が二重になる不具合を修正。
 * **v0.1.0 (2026-10-16)** 最初の版。抽選型・時間型の 2 種類、HUD、音とチャットの知らせ、実測、手動の記録、NM の追加。
+
+## 不具合・動作報告 / Feedback
+
+「動きました」の一言だけでも歓迎です。GitHub のアカウントがあれば、[Issues](../../issues/new/choose) から書き込めます (日本語・英語どちらでも)。
+
+A one-line "it works" is welcome too. With a GitHub account you can post from [Issues](../../issues/new/choose) (Japanese or English).
