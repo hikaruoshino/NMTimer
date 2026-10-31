@@ -35,7 +35,7 @@
 
 _addon.name     = "NMTimer"
 _addon.author   = "hikaruoshino"
-_addon.version  = "0.6.0"
+_addon.version  = "0.6.1"
 _addon.commands = {"nmtimer", "nmt"}
 
 local config = require("config")
@@ -364,7 +364,7 @@ local function describe_wait(e)
     local min, max, approx, learned = timing(e)
     if not min then return nil end
     local text
-    if max and max > min then text = string.format("%d〜%d分", min, max) else text = string.format("%d分", min) end
+    if max and max > min then text = string.format("%d～%d分", min, max) else text = string.format("%d分", min) end
     if learned then text = text .. "(学習)" elseif approx then text = text .. "(目安)" end
     return text
 end
