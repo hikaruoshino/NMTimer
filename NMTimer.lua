@@ -35,7 +35,7 @@
 
 _addon.name     = "NMTimer"
 _addon.author   = "hikaruoshino"
-_addon.version  = "0.6.2"
+_addon.version  = "0.6.3"
 _addon.commands = {"nmtimer", "nmt"}
 
 local config = require("config")
@@ -75,6 +75,13 @@ local LEARN_MIN_SEC = 180                          -- 学習に使う実測の�
 local ALIVE_KEEP_SEC = 120                -- 生きている状態を最後に見てから、倒れた更新を討伐とみなす猶予 (これを過ぎたら「見ていない」扱い)
 local ALIVE_LIMIT = 4000                 -- alive_seen の件数の上限 (超えたら古いものだけ捨てる)
 local UNKNOWN_KEEP_SEC = 3 * 3600                  -- 時間が分からない NM の記録を HUD に残す時間 (出るのを見ない限り終わりが無いので期限を付ける)
+local SAVED_LIMIT = 5000                 -- 読み込む記録・学習データ・自分で足した NM の件数の上限 (壊れた・大きすぎる保存で重くしない)
+local MEASURE_KEEP = 5                   -- NM ごとに覚える実測の数
+local PH_MEASURE_KEEP = 10               -- PH ごとに覚える実測の数
+local SAVE_RETRY_SEC = 5                 -- 画面の更新で消えた記録の保存に失敗したとき、次に試すまでの秒数
+local FUTURE_SLACK_SEC = 300             -- 時刻 (at) が今よりこれ以上先の記録は使わない (PC の時計を戻したとき・壊れた保存)
+local BROKEN_KEEP = 5                    -- 読めなかったファイル (.broken-日時) を、保存先ごとに新しいものからいくつ残すか
+local LOGIN_CHECK_SEC = 1                -- ログアウト中に、ログインしたかを見直す間隔 (login イベントが来ないときのため)
 
 -- -----------------------------------------------------------------------------
 -- 小さな道具
@@ -146,14 +153,6 @@ local function serialize(v, indent)
     return "{\n" .. table.concat(lines, ",\n") .. "\n" .. indent .. "}"
 end
 
-local function write_table(path, tbl)
-    local f = io.open(path, "w")
-    if not f then return false end
-    f:write("return " .. serialize(tbl) .. "\n")
-    f:close()
-    return true
-end
-
 local function read_table(path)
     local chunk = loadfile(path)
     if not chunk then return nil end
@@ -163,11 +162,264 @@ local function read_table(path)
     return nil
 end
 
-local last_error_at = -100
-local function report_error(where, err)
+local function file_present(path)
+    local f = io.open(path, "rb")
+    if not f then return false end
+    f:close()
+    return true
+end
+
+local function read_text(path)
+    local f = io.open(path, "r")
+    if not f then return nil end
+    local s = f:read("*a")
+    f:close()
+    return s
+end
+
+-- 読めなかったファイルを残す名前 (path.broken-日時)。同じ秒に 2 回目があれば -02・-03 … を付けて、前のものと重ねない
+local function broken_name(path)
+    local base = path .. ".broken-" .. os.date("%Y%m%d-%H%M%S", os.time())
+    if not file_present(base) then return base end
+    for n = 2, 99 do
+        local name = string.format("%s-%02d", base, n)
+        if not file_present(name) then return name end
+    end
+    return nil
+end
+
+-- path の .broken- ファイルを、新しい BROKEN_KEEP 個だけ残して消す (名前の日時の順。自分で付けた形の名前だけ)
+local function prune_broken(path)
+    if type(windower.get_dir) ~= "function" then return end
+    local dir, file = path:match("^(.*)[/\\]([^/\\]+)$")
+    if not dir then return end
+    local ok, list = pcall(windower.get_dir, dir)
+    if not ok or type(list) ~= "table" then return end
+    local prefix = file .. ".broken-"
+    local found = {}
+    for _, name in pairs(list) do
+        if type(name) == "string" and name:sub(1, #prefix) == prefix
+                and name:sub(#prefix + 1):find("^%d%d%d%d%d%d%d%d%-%d%d%d%d%d%d") then
+            found[#found + 1] = name
+        end
+    end
+    if #found <= BROKEN_KEEP then return end
+    table.sort(found)                               -- 日時の順 (同じ秒の -02 … は、その後ろ)
+    for i = 1, #found - BROKEN_KEEP do os.remove(dir .. "/" .. found[i]) end
+end
+
+-- 読めなかったのに別名にできなかった本体のパス。保存のとき、これを .bak に回して良い .bak を消さないための印
+local broken_left = {}
+
+-- 保存は、同じフォルダの一時ファイル (.tmp) に書き、write と close の成功と、読み直した中身を確かめてから本名に置き換える
+-- (容量不足や保存途中の終了で、前の保存を失わないため)。Windows の os.rename は既存のファイルを上書きできないので、
+-- 今のファイルを .prev に移し、一時ファイルを本名にしてから、.prev を .bak (前回の保存) にする。
+-- 正常な .bak は、新しい本体を置けるまで消さない (どこで失敗しても、本体か .bak のどちらかから戻せる)。
+-- 置き換えの途中で止まったときは、読み込みで .prev・.bak を使う。
+-- 戻り値: 成功か, 失敗の理由
+local function write_table(path, tbl)
+    local text = "return " .. serialize(tbl) .. "\n"
+    local tmp, prev, bak = path .. ".tmp", path .. ".prev", path .. ".bak"
+    local f, err = io.open(tmp, "w")
+    if not f then return false, err end
+    local wrote, werr = f:write(text)
+    local closed, cerr = f:close()
+    if not wrote or not closed then
+        os.remove(tmp)
+        return false, werr or cerr or "write failed"
+    end
+    if read_text(tmp) ~= text or not read_table(tmp) then
+        os.remove(tmp)
+        return false, "verify failed: " .. tmp
+    end
+    if broken_left[path] then
+        -- 読めなかった本体が残っている: .prev・.bak に回すと良い .bak を消すので、もう一度別名にし、だめなら消す
+        local name = broken_name(path)
+        if not (name and os.rename(path, name)) then os.remove(path) end
+        if file_present(path) then
+            os.remove(tmp)
+            return false, "could not move the unreadable " .. path
+        end
+        broken_left[path] = nil
+    end
+    local moved = false
+    if file_present(path) then
+        os.remove(prev)                             -- 前回の途中で残ったもの (本体があるので使わない)
+        local ok, merr = os.rename(path, prev)
+        if not ok then
+            os.remove(tmp)
+            return false, merr
+        end
+        moved = true
+    end
+    local ok, rerr = os.rename(tmp, path)
+    if not ok then
+        if moved then os.rename(prev, path) end     -- 前の保存を本名に戻す (.bak は触っていない)
+        os.remove(tmp)
+        return false, rerr
+    end
+    if file_present(prev) then                      -- 新しい本体を置けたので、前の本体を .bak にする
+        os.remove(bak)
+        os.rename(prev, bak)                        -- 失敗しても .prev が残り、読み込みで使える
+    end
+    return true
+end
+
+-- -----------------------------------------------------------------------------
+-- 読み込んだ表の検証 (文法上は読めても、型の違う値で止まらないように)
+-- -----------------------------------------------------------------------------
+local function finite(v)
+    return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+end
+local function opt_finite(v) return v == nil or finite(v) end
+local function is_string(v) return type(v) == "string" end
+local function valid_sight(v) return v == nil or v == true or v == false or v == "returned" end
+
+-- nil か、配列の項目が全部 check に通る表か
+local function list_of(v, check)
+    if v == nil then return true end
+    if type(v) ~= "table" then return false end
+    for _, x in ipairs(v) do
+        if not check(x) then return false end
+    end
+    return true
+end
+
+-- 表のうち check(k, v) に通る項目だけを、SAVED_LIMIT 件まで写す
+local function keep_valid(map, check)
+    local out, n = {}, 0
+    for k, v in pairs(map or {}) do
+        if n >= SAVED_LIMIT then break end
+        if check(k, v) then out[k] = v; n = n + 1 end
+    end
+    return out
+end
+
+-- 時刻 at が、今 (now) より FUTURE_SLACK_SEC を超えて先か。先の記録は、残り時間が大きく出て、再出現も学習も来ない
+local function future(at, now)
+    return at > now + FUTURE_SLACK_SEC
+end
+
+-- now: 比べる今の時刻 (os.time)。省くと今
+local function valid_record(rk, r, now)
+    return type(rk) == "string" and type(r) == "table" and is_string(r.key) and finite(r.zone) and finite(r.at)
+        and not future(r.at, now or os.time())
+        and opt_finite(r.x) and opt_finite(r.y) and opt_finite(r.z) and valid_sight(r.sight)
+end
+
+local function valid_slot(id, s, now)
+    return finite(id) and type(s) == "table" and is_string(s.key) and finite(s.zone) and finite(s.at)
+        and not future(s.at, now or os.time())
+        and opt_finite(s.x) and opt_finite(s.y) and valid_sight(s.sight) and (s.name == nil or is_string(s.name))
+end
+
+-- 実測の列のうち、check に通るものを、新しい方から keep 個まで残す
+local function clean_samples(list, check, keep)
+    local out = {}
+    for _, v in ipairs(list) do
+        if check(v) then out[#out + 1] = v end
+    end
+    while #out > keep do table.remove(out, 1) end
+    return out
+end
+
+-- 実測の秒数は 0 以上 (負の値は、時計が戻ったときの誤り)
+local function valid_secs(v)
+    return finite(v) and v >= 0
+end
+
+local function valid_ph_sample(smp, now)
+    return type(smp) == "table" and finite(smp.id) and valid_secs(smp.secs) and opt_finite(smp.at)
+        and (smp.at == nil or not future(smp.at, now or os.time()))
+end
+
+-- state.lua の中身を確かめる。トップレベルの型が違えば nil (使わない)。不正な項目は捨てる。欠けた表は空で補う
+local function clean_state(s)
+    if type(s) ~= "table" then return nil end
+    for _, field in ipairs({"records", "ph_slots", "ph_measured", "measured"}) do
+        if s[field] ~= nil and type(s[field]) ~= "table" then return nil end
+    end
+    local now = os.time()                      -- これより先の時刻の記録・PH の記録・実測は捨てる
+    -- 記録: 件数が上限を超えたら、新しいものを残す
+    local src, keys = s.records or {}, {}
+    for rk, r in pairs(src) do
+        if valid_record(rk, r, now) then keys[#keys + 1] = rk end
+    end
+    if #keys > SAVED_LIMIT then table.sort(keys, function(a, b) return src[a].at > src[b].at end) end
+    local records = {}
+    for i = 1, math.min(#keys, SAVED_LIMIT) do records[keys[i]] = src[keys[i]] end
+    -- PH の記録: エリアごとの表の中の、ID ごとの項目を確かめる (全体で SAVED_LIMIT 件まで)
+    local ph_slots, n = {}, 0
+    for rk, slots in pairs(s.ph_slots or {}) do
+        if type(rk) == "string" and type(slots) == "table" then
+            local kept
+            for id, slot in pairs(slots) do
+                if n >= SAVED_LIMIT then break end
+                if valid_slot(id, slot, now) then
+                    kept = kept or {}
+                    kept[id] = slot
+                    n = n + 1
+                end
+            end
+            if kept then ph_slots[rk] = kept end
+        end
+    end
+    -- 学習データ (実測)
+    local ph_measured = keep_valid(s.ph_measured, function(rk, list) return type(rk) == "string" and type(list) == "table" end)
+    for rk, list in pairs(ph_measured) do
+        local kept = clean_samples(list, valid_ph_sample, PH_MEASURE_KEEP)
+        ph_measured[rk] = #kept > 0 and kept or nil
+    end
+    local measured = keep_valid(s.measured, function(key, list) return type(key) == "string" and type(list) == "table" end)
+    for key, list in pairs(measured) do
+        local kept = clean_samples(list, valid_secs, MEASURE_KEEP)
+        measured[key] = #kept > 0 and kept or nil
+    end
+    return {records = records, ph_slots = ph_slots, ph_measured = ph_measured, measured = measured}
+end
+
+-- 自分で足した NM (rebuild_index・timing・ph_wait が使う項目の型)
+local function valid_entry(e)
+    return type(e) == "table" and is_string(e.key) and is_string(e.name)
+        and list_of(e.zone_ids, finite) and list_of(e.zones, is_string) and list_of(e.alias, is_string) and list_of(e.ph, is_string)
+        and opt_finite(e.min) and opt_finite(e.max) and opt_finite(e.ph_repop)
+        and (e.job == nil or is_string(e.job)) and (e.hint == nil or is_string(e.hint))
+end
+
+local USER_TABLES = {"entries", "alias", "times", "ignored", "ph_ids", "ph_times", "ph_excluded"}
+
+-- user.lua の中身を確かめる。トップレベルの型が違えば nil (使わない)。不正な項目は捨てる。欠けた表は空で補う
+local function clean_user(u)
+    if type(u) ~= "table" then return nil end
+    for _, field in ipairs(USER_TABLES) do
+        if u[field] ~= nil and type(u[field]) ~= "table" then return nil end
+    end
+    local entries = {}
+    for _, e in ipairs(u.entries or {}) do
+        if #entries >= SAVED_LIMIT then break end
+        if valid_entry(e) then entries[#entries + 1] = e end
+    end
+    local ph_ids = keep_valid(u.ph_ids, function(key, ids) return is_string(key) and type(ids) == "table" end)
+    for key, ids in pairs(ph_ids) do
+        ph_ids[key] = keep_valid(ids, function(id) return finite(id) end)
+    end
+    return {
+        entries = entries,
+        alias = keep_valid(u.alias, function(key, list) return is_string(key) and type(list) == "table" and list_of(list, is_string) end),
+        times = keep_valid(u.times, function(key, t) return is_string(key) and type(t) == "table" and finite(t.min) and opt_finite(t.max) end),
+        ignored = keep_valid(u.ignored, function(key) return is_string(key) end),
+        ph_ids = ph_ids,
+        ph_times = keep_valid(u.ph_times, function(key, minutes) return is_string(key) and finite(minutes) end),
+        ph_excluded = keep_valid(u.ph_excluded, function(id) return finite(id) end),
+    }
+end
+
+local last_error_at = {}   -- 知らせの文 (where) → 最後に知らせた時刻。保存先ごと・エラーの種類ごとに間引く
+-- immediate: 間引かずにすぐ知らせる (コマンドを打った直後の失敗は、その場で知らせる)
+local function report_error(where, err, immediate)
     local now = os.clock()
-    if now - last_error_at < 10 then return end   -- 同じエラーで画面を埋めない
-    last_error_at = now
+    if not immediate and last_error_at[where] and now - last_error_at[where] < 10 then return end   -- 同じエラーで画面を埋めない
+    last_error_at[where] = now
     chat(string.format("[NMTimer] %s: %s", where, tostring(err)), 123)
 end
 
@@ -186,9 +438,10 @@ local zone_sets = {}       -- NM の key → 出るエリアの ID の集合 (�
 local nm_zones = {}        -- 登録された NM が1体でもいるエリアの ID の集合
 local zone_by_en = nil
 local current_zone = 0
-local state_dirty = false  -- 画面の更新で記録が消えたとき、保存し直すための印
+local state_dirty = false  -- 画面の更新で記録が消えたとき、保存し直すための印 (保存に成功したら消す)
+local logged_in = true      -- ログイン中だけ HUD・知らせ・パケットを扱う (起動時は get_info で決め、login / logout で切り替える)
 local pending_sight = false -- 再出現の実測を待っている記録があるか (パケットごとの確認を軽くするため)
-local ph_pending = {}       -- 再湧きの実測を待っている PH の ID → 記録の key のつづき (rk)
+local ph_pending = {}       -- 再湧きの実測を待っている PH の ID → 記録の key のつづき (rk) の集合
 local ph_told = {}          -- PH の記録を知らせた ID (同じ ID で何度も知らせない)
 
 local function ensure_dir()
@@ -242,14 +495,61 @@ local function rebuild_index()
     for _, e in ipairs(user.entries) do add_entry(e) end
 end
 
-local function save_state()
+-- immediate: 失敗を間引かずに知らせる (コマンドから保存するとき)。戻り値: 保存できたか
+local function save_state(immediate)
     ensure_dir()
-    write_table(STATE_FILE, state)
+    local ok, err = write_table(STATE_FILE, state)
+    if ok then
+        state_dirty = false                    -- 今の記録 (消した記録を含む) がディスクに入った
+    else
+        report_error("state.lua を保存できませんでした (前の保存は残しています)", err, immediate)
+    end
+    return ok
 end
 
+-- user.lua はコマンドからだけ保存する: 失敗はいつも、その場で知らせる。戻り値: 保存できたか
 local function save_user()
     ensure_dir()
-    write_table(USER_FILE, user)
+    local ok, err = write_table(USER_FILE, user)
+    if not ok then report_error("user.lua を保存できませんでした (前の保存は残しています)", err, true) end
+    return ok
+end
+
+-- コマンドの結果の文に足す: 保存できなかったときは、次の起動で元に戻ることを書く
+local function unsaved_note(saved)
+    return saved and "" or "(保存できなかったため、次の起動では元に戻ります)"
+end
+
+-- 読めて、検証 (clean) に通った表だけを返す
+local function read_valid(path, clean)
+    local tbl = read_table(path)
+    return tbl and clean(tbl)
+end
+
+-- 前回の保存を読む。置き換えの途中で止まったときの .prev (直前の本体) を先に、なければ .bak
+local function read_backup(path, clean)
+    return read_valid(path .. ".prev", clean) or read_valid(path .. ".bak", clean)
+end
+
+-- 保存したファイルを読む。読めないとき (文法の誤り・型の違い) は、壊れたファイルを別名 (.broken-日時) で残してから、
+-- .bak (前回の保存) を読む。.bak も読めなければ空で始める (戻り値 nil)。
+-- 別名は同じ秒でも重ならないように連番を付け、新しい BROKEN_KEEP 個だけ残す。別名にできなければ、次の保存で .bak に回さない
+local function load_saved(path, label, clean)
+    broken_left[path] = nil
+    if not file_present(path) then
+        return read_backup(path, clean)        -- 置き換えの途中で止まったときは、本名が無く .prev・.bak だけが残る
+    end
+    local tbl = read_valid(path, clean)
+    if tbl then return tbl end
+    local keep = broken_name(path)
+    local moved = keep ~= nil and os.rename(path, keep) and true or false
+    if moved then prune_broken(path) else broken_left[path] = true end
+    local backup = read_backup(path, clean)
+    chat(string.format("[NMTimer] %s を読めませんでした。%s%s", label,
+        moved and ("壊れたファイルを " .. keep:match("[^/\\]+$") .. " として残しました。")
+            or "壊れたファイルを別名にできませんでした (次の保存で、もう一度試します。前回の保存 (.bak) は残します)。",
+        backup and "前回の保存 (.bak) から読み込みます。" or "空の状態で始めます。"), 123)
+    return backup
 end
 
 local function load_all()
@@ -264,11 +564,8 @@ local function load_all()
             end
         end
     end
-    local u = read_table(USER_FILE) or {}
-    user = {entries = u.entries or {}, alias = u.alias or {}, times = u.times or {}, ignored = u.ignored or {},
-            ph_ids = u.ph_ids or {}, ph_times = u.ph_times or {}, ph_excluded = u.ph_excluded or {}}
-    local s = read_table(STATE_FILE) or {}
-    state = {records = s.records or {}, ph_slots = s.ph_slots or {}, ph_measured = s.ph_measured or {}, measured = s.measured or {}}
+    user = load_saved(USER_FILE, "user.lua", clean_user) or clean_user({})
+    state = load_saved(STATE_FILE, "state.lua", clean_state) or clean_state({})
     rebuild_index()
 end
 
@@ -321,7 +618,12 @@ local function recount_pending()
     ph_pending = {}
     for rk, slots in pairs(state.ph_slots) do
         for id, slot in pairs(slots) do
-            if slot.sight and slot.zone == current_zone then ph_pending[id] = rk end
+            if slot.sight and slot.zone == current_zone then
+                -- 同じ PH が 2 体以上の NM に登録されていると、1 つの ID に記録が複数できる。全部を覚える
+                local set = ph_pending[id]
+                if not set then set = {}; ph_pending[id] = set end
+                set[rk] = true
+            end
         end
     end
 end
@@ -369,11 +671,12 @@ local function describe_wait(e)
     return text
 end
 
-local function record_kill(e, zone, x, y, z, when)
+-- immediate: コマンド (//nmt tod) からの記録。保存の失敗を間引かずに知らせる
+local function record_kill(e, zone, x, y, z, when, immediate)
     if not tracked(e) then return end
     local rk = rec_key(e, zone)
     state.records[rk] = {key = e.key, zone = zone, at = when, x = x, y = y, z = z, sight = (zone == current_zone)}
-    save_state()
+    save_state(immediate)
     recount_pending()
     local wait = describe_wait(e)
     local label = e.kind == "lottery" and "抽選の開始" or "再出現"
@@ -384,11 +687,12 @@ local function record_kill(e, zone, x, y, z, when)
     end
 end
 
-local function record_ph(e, zone, id, x, y, when)
+-- name: 倒れたときに確かめた敵の名前 (再湧きのとき、同じ ID に別の敵が出たのを見分けるため)
+local function record_ph(e, zone, id, x, y, when, name)
     if not tracked(e) then return end
     local rk = rec_key(e, zone)
     local slots = state.ph_slots[rk] or {}
-    slots[id] = {key = e.key, zone = zone, at = when, x = x, y = y, sight = (zone == current_zone)}
+    slots[id] = {key = e.key, zone = zone, at = when, x = x, y = y, sight = (zone == current_zone), name = name}
     state.ph_slots[rk] = slots
     save_state()
     recount_pending()
@@ -399,34 +703,46 @@ local function record_ph(e, zone, id, x, y, when)
 end
 
 -- PH が再び現れた (同じ ID)。倒してから見続けていたときだけ、かかった時間を実測として覚える
-local function on_ph_respawn(id, when)
-    local rk = ph_pending[id]
-    if not rk then return end
-    local slots = state.ph_slots[rk]
-    local slot = slots and slots[id]
-    if not slot then ph_pending[id] = nil return end
-    local secs = when - slot.at
-    if secs < PH_SIGHT_MIN_SEC then return end              -- 倒れる途中の更新かもしれない
-    slots[id] = nil
-    local e = by_key[slot.key]
-    if e and slot.sight == true and secs <= PH_SLOT_KEEP_SEC then
-        local list = state.ph_measured[rk] or {}
-        list[#list + 1] = {id = id, secs = secs, at = when}
-        while #list > 10 do table.remove(list, 1) end
-        state.ph_measured[rk] = list
-        chat(string.format("[NMTimer] %s の PH(%s ID %s) が約%d分で再び湧きました(実測 %s)。", e.name, e.ph and e.ph[1] or "PH", id_tag(id),
-            math.floor(secs / 60 + 0.5), fmt_time(secs)))
+-- 同じ ID の記録が複数の NM にあるとき (同じ PH を 2 体の NM に登録したとき) は、同じ更新で全部を処理する
+-- name: 今の個体の名前 (分からなければ nil)。倒れたときの名前と違えば、同じ ID に別の敵が湧いたので、学習せずに記録だけ消す
+local function on_ph_respawn(id, when, name)
+    local set = ph_pending[id]
+    if not set then return end
+    local changed, stale = false, false
+    for rk in pairs(set) do
+        local slots = state.ph_slots[rk]
+        local slot = slots and slots[id]
+        if not slot then
+            stale = true                                     -- 記録が消えていた: 数え直す
+        elseif name and slot.name and name:lower() ~= slot.name:lower() then
+            slots[id] = nil                                  -- 別の敵: PH の再湧きとは学習しない
+            changed = true
+            if next(slots) == nil then state.ph_slots[rk] = nil end
+        elseif when - slot.at >= PH_SIGHT_MIN_SEC then       -- それより早い更新は、倒れる途中のものかもしれない
+            local secs = when - slot.at
+            slots[id] = nil
+            changed = true
+            local e = by_key[slot.key]
+            if e and slot.sight == true and secs <= PH_SLOT_KEEP_SEC then
+                local list = state.ph_measured[rk] or {}
+                list[#list + 1] = {id = id, secs = secs, at = when}
+                while #list > PH_MEASURE_KEEP do table.remove(list, 1) end
+                state.ph_measured[rk] = list
+                chat(string.format("[NMTimer] %s の PH(%s ID %s) が約%d分で再び湧きました(実測 %s)。", e.name, e.ph and e.ph[1] or "PH", id_tag(id),
+                    math.floor(secs / 60 + 0.5), fmt_time(secs)))
+            end
+            if next(slots) == nil then state.ph_slots[rk] = nil end
+        end
     end
-    if next(slots) == nil then state.ph_slots[rk] = nil end
-    save_state()
-    recount_pending()
+    if changed then save_state() end
+    if changed or stale then recount_pending() end
 end
 
 local function note_sighting(e, rec, rk, when)
     local secs = when - rec.at
     local list = state.measured[e.key] or {}
     list[#list + 1] = secs
-    while #list > 5 do table.remove(list, 1) end
+    while #list > MEASURE_KEEP do table.remove(list, 1) end
     state.measured[e.key] = list
     state.records[rk] = nil
     save_state()
@@ -460,6 +776,15 @@ local nm_id_count = 0
 
 local function nm_id_key(zone, id)
     return tostring(zone) .. ":" .. tostring(id)
+end
+
+-- 受信側の観測 (倒れた・生きている・覚えた ID) を捨てる。ゾーン変更・ログイン・ログアウトのとき
+local function reset_observed()
+    seen_dead = {}
+    alive_seen = {}
+    alive_n = 0
+    nm_ids = {}
+    nm_id_count = 0
 end
 
 local function u32(data, offset)
@@ -559,8 +884,8 @@ local function on_death(id)
             if user.ph_excluded[id] then counted = false
             elseif marked and next(marked) then counted = marked[id]
             elseif e.quiet_ph then counted = false      -- BG-Wiki のデータの PH は一般の敵と同名が多い。//nmt ph で指定するまで数えない
-            else counted = (mob.distance or 0) <= PH_NEAR_SQ end
-            if counted then record_ph(e, current_zone, id, mob.x, mob.y, when) end
+            else counted = type(mob.distance) == "number" and mob.distance <= PH_NEAR_SQ end   -- 距離が分からなければ数えない
+            if counted then record_ph(e, current_zone, id, mob.x, mob.y, when, mob.name) end
         end
     end
 end
@@ -573,28 +898,78 @@ local function note_returned(e, rec, rk, when)
     chat(string.format("[NMTimer] %s は、戻ったら出ていました(倒してから約%d分以内)。", e.name, math.floor((when - rec.at) / 60 + 0.5)))
 end
 
-local function sight_entry(e, when)
+-- hold: どの記録の再出現か決められない (同名の登録が 2 件以上)。実測を学習せず、記録もそのまま残す
+local function sight_entry(e, when, hold)
     local rk = rec_key(e, current_zone)
     local rec = state.records[rk]
+    if rec and future(rec.at, when) then
+        -- 今より先の時刻の記録 (PC の時計を戻した): 再出現も学習も来ないので、記録を消す
+        state.records[rk] = nil
+        save_state()
+        recount_pending()
+        return
+    end
     if rec and rec.sight and when - rec.at >= SIGHT_MIN_SEC then
-        if rec.sight == true then note_sighting(e, rec, rk, when) else note_returned(e, rec, rk, when) end
+        if rec.sight ~= true then note_returned(e, rec, rk, when)
+        elseif not hold then note_sighting(e, rec, rk, when) end
     end
 end
 
+-- 今のエリアに、この名前の登録が 2 件以上あるか
+local function ambiguous_here(list)
+    local n = 0
+    for _, e in ipairs(list) do
+        if zone_sets[e.key][current_zone] then
+            n = n + 1
+            if n > 1 then return true end
+        end
+    end
+    return false
+end
+
 local function on_sighted(name)
+    local list = name_index[name:lower()]
+    if not list then return end
     local when = os.time()
-    for _, e in ipairs(name_index[name:lower()] or {}) do sight_entry(e, when) end
+    local hold = ambiguous_here(list)
+    for _, e in ipairs(list) do sight_entry(e, when, hold) end
 end
 
 -- 生きている状態の更新が初めて届いた (湧いた)。PH の再湧き・NM の再出現の判定はここで行う。
 -- 名前つきの更新 (位置と名前だけ) は、まだ出ていない敵に近づいただけでも届くので、再出現とはみなさない (ゲーム内で確認 2026-10-31)
+-- その名前 (別名を含む) が、この NM のものか
+local function named_as(e, name)
+    for _, x in ipairs(name_index[name:lower()] or {}) do
+        if x == e then return true end
+    end
+    return false
+end
+
 local function on_alive(id, name)
-    if ph_pending[id] then on_ph_respawn(id, os.time()) end
+    if ph_pending[id] then
+        -- 今の個体の名前 (更新の名前が読めなければ敵の一覧から)。倒れたときの PH の名前と照合する
+        local current = name and readable_name(name) and name or nil
+        if not current then
+            local mob = windower.ffxi.get_mob_by_id(id)
+            if mob and mob.name and mob.name ~= "" then current = mob.name end
+        end
+        on_ph_respawn(id, os.time(), current)
+    end
     if pending_sight then
         local known = by_key[nm_ids[nm_id_key(current_zone, id)]]
-        if known then -- 倒したときに名前から覚えた ID なら、更新の名前を読まずに出現とする (NM の更新は名前の位置が違うことがある)
-            sight_entry(known, os.time())
-            return
+        if known then
+            -- 倒したときに名前から覚えた ID。今の個体の名前が読めれば先に照合する (同じ ID を別の敵が使い回すことがある)。
+            -- 名前が読めないときは、ID だけで出現とする (NM の更新は名前の位置が違うことがある)
+            local current = name and readable_name(name) and name or nil
+            if not current then
+                local mob = windower.ffxi.get_mob_by_id(id)
+                if mob and mob.name and mob.name ~= "" then current = mob.name end
+            end
+            if not current or named_as(known, current) then
+                sight_entry(known, os.time())
+                return
+            end
+            name = current                    -- 名前が違う: 覚えた ID では出現にせず、記録も消さない (今の名前で探すだけ)
         end
         if not name then
             local mob = windower.ffxi.get_mob_by_id(id)
@@ -617,16 +992,18 @@ local function on_npc_update(data)
             chat(string.format("[NMTimer debug] 監視中の更新: ID %s / マスク %d / 状態 %s / 長さ %d", id_tag(wid), mask, mask % 8 >= 4 and tostring(data:byte(0x20)) or "-", #data), 160)
         end
     end
-    local dead = false
-    if mask % 8 >= 4 then                       -- ビット 2: HP・状態が入っている
+    local alive_id = nil                        -- HP が正の生存の更新だった敵の ID
+    if mask % 8 >= 4 then                       -- ビット 2: HP (0x1E)・状態 (0x1F) が入っている
         local status = data:byte(0x20)
         if status and DEAD_STATUS[status] then
-            dead = true
             local id = u32(data, 0x05)
             if id and alive_fresh(id) then on_death(id) end      -- 生きている状態を見た敵だけ数える (まだ出ていない NM が、近づいたときに倒れた状態で届くのを数えない)
         elseif status then
-            local id = u32(data, 0x05)
+            -- 生きている側は HP (0x1E = HP の割合 0〜100。libs/packets/fields.lua) が正のときだけ。HP 0 の更新は生存とみなさない
+            local hpp = data:byte(0x1F)
+            local id = hpp and hpp > 0 and u32(data, 0x05)
             if id then
+                alive_id = id
                 local now_c = os.clock()
                 local fresh = alive_seen[id] ~= nil and now_c - alive_seen[id] <= ALIVE_KEEP_SEC
                 if alive_seen[id] == nil then alive_n = alive_n + 1 end
@@ -639,11 +1016,10 @@ local function on_npc_update(data)
             end
         end
     end
-    if mask % 16 >= 8 and not dead then         -- ビット 3: 名前が入っている = 現れた (湧き直した)
-        local id = u32(data, 0x05)
-        if id then
-            seen_dead[id] = nil                 -- 同じ敵がまた倒れたら、もう一度数える
-        end
+    -- ビット 3 (名前) とビット 2 (HP が正の生存) がそろった更新 = 湧き直した。同じ敵がまた倒れたら、もう一度数える。
+    -- 名前だけの更新 (HP の情報なし) は、まだ出ていない敵に近づいただけでも届くので、倒れた印を消さない
+    if alive_id and mask % 16 >= 8 then
+        seen_dead[alive_id] = nil
     end
     -- ビット 3: 名前が入っている (現れたとき)。登録 NM のいないエリアでは、名前を読まない (パケットごとの処理を増やさない)
     if mask % 16 >= 8 and #data >= 0x35 and nm_zones[current_zone] then
@@ -659,11 +1035,13 @@ end
 
 -- 0x02D : 自分が経験値などを得たときに届く通知 (Target = 倒した敵の ID。RoE の更新では Target がプレイヤー)。
 -- 全ての討伐が届くわけではない (他の人だけが倒した敵・経験値の入らない敵は届かない) ので、0x00E の補助として使う。
--- 本当に倒れているときだけ数える (二重の記録は seen_dead が防ぐ)
+-- 本当に倒れているときだけ数える。数えた撃破の再通知 (経験値・リミットポイントなど) では、撃破時刻を上書きしない
+-- (倒れた印 seen_dead は、湧き直した更新かゾーン変更で消える)
+local EXP_MIN_LEN = 0x1A    -- Message (0x18〜0x19。libs/packets/fields.lua の 0x02D) まで届く長さ。短いものは捨てる
 local function on_exp_message(data)
-    if #data < 0x0C then return end
+    if #data < EXP_MIN_LEN then return end
     local target = u32(data, 0x09)
-    if not target then return end
+    if not target or seen_dead[target] then return end
     local mob = windower.ffxi.get_mob_by_id(target)
     if mob and mob.is_npc ~= false and ((mob.hpp or 100) == 0 or DEAD_STATUS[mob.status or -1]) then
         on_death(target)
@@ -671,6 +1049,7 @@ local function on_exp_message(data)
 end
 
 windower.register_event("incoming chunk", function(id, data)
+    if not logged_in then return end            -- ログアウト中に届いたものは使わない (保存もチャットもしない)
     local handler = id == 0x00E and on_npc_update or id == 0x02D and on_exp_message
     if not handler then return end
     local ok, err = pcall(handler, data)
@@ -725,7 +1104,10 @@ local function build_rows(now)
     local rows = {}
     for rk, rec in pairs(state.records) do
         local e = by_key[rec.key]
-        if e and tracked(e) then
+        if future(rec.at, now) then
+            state.records[rk] = nil               -- 今より先の時刻 (PC の時計を戻した): 残り時間が大きく出るので消す
+            state_dirty = true
+        elseif e and tracked(e) then
             local row = describe(rec, e, now)
             if row.done_at and now >= row.done_at then
                 state.records[rk] = nil           -- 出られるようになって十分たったら消す
@@ -739,8 +1121,8 @@ local function build_rows(now)
         local soonest, soonest_slot, soonest_id, count = nil, nil, nil, 0
         for id, slot in pairs(slots) do
             local e = by_key[slot.key]
-            if not e or now - slot.at > PH_SLOT_KEEP_SEC then
-                slots[id] = nil                       -- 古い記録 (実測にも使わない) は捨てる
+            if not e or now - slot.at > PH_SLOT_KEEP_SEC or future(slot.at, now) then
+                slots[id] = nil                       -- 古い記録 (実測にも使わない)・今より先の時刻の記録は捨てる
                 state_dirty = true
             else
                 local wait = ph_wait(e, slot.zone, id)
@@ -768,10 +1150,14 @@ end
 
 local hud = texts.new("", settings)
 local last_hud_text = nil
+local next_save_retry = 0   -- 消えた記録の保存に失敗したとき、次に試す時刻 (os.clock)
 
 local function refresh_hud(now)
     local rows = build_rows(now)
-    if state_dirty then state_dirty = false; save_state() end
+    -- 消えた記録を保存し直す。失敗したら印 (state_dirty) を残し、SAVE_RETRY_SEC 秒ごとに試す
+    if state_dirty and os.clock() >= next_save_retry and not save_state() then
+        next_save_retry = os.clock() + SAVE_RETRY_SEC
+    end
     if not settings.show then
         if last_hud_text ~= "" then hud:hide() end
         last_hud_text = ""
@@ -828,7 +1214,18 @@ local function check_alerts(now)
 end
 
 local next_refresh = 0
+local next_login_check = 0
+local on_login                                 -- 下で定義する (login イベントと同じ処理)
 windower.register_event("prerender", function()
+    if not logged_in then
+        -- 起動時にログアウト中だと、login イベントが来るまで止まる。毎秒 get_info を見直して、ログインしていたら戻す
+        local check_c = os.clock()
+        if check_c < next_login_check then return end
+        next_login_check = check_c + LOGIN_CHECK_SEC
+        local info = windower.ffxi.get_info()
+        if not (info and info.logged_in) then return end
+        on_login()
+    end
     local now_c = os.clock()
     if now_c < next_refresh then return end
     next_refresh = now_c + REFRESH_SEC
@@ -860,11 +1257,7 @@ local function mark_returned()
 end
 
 windower.register_event("zone change", function(new_id)
-    seen_dead = {}
-    alive_seen = {}
-    alive_n = 0
-    nm_ids = {}                                -- 覚えた ID は、そのエリアにいるあいだだけ使う
-    nm_id_count = 0
+    reset_observed()                           -- 覚えた ID は、そのエリアにいるあいだだけ使う
     -- エリアを離れたら、実測は取らない (戻ってきたときに出ているのは、いつ出たか分からない)。見えたら記録だけ消す
     mark_returned()
     current_zone = tonumber(new_id) or current_zone
@@ -872,27 +1265,32 @@ windower.register_event("zone change", function(new_id)
     save_state()
 end)
 
-windower.register_event("login", function()
+on_login = function()
+    logged_in = true
     update_zone()
     mark_returned()                            -- ログアウトや強制終了のあいだは見ていなかった
-    seen_dead = {}
-    alive_seen = {}
-    alive_n = 0
-    nm_ids = {}
-    nm_id_count = 0
+    reset_observed()
     recount_pending()
-end)
+end
+windower.register_event("login", function() on_login() end)
+
+-- 設定 (data/settings.xml) を保存する。書き込めないときの libs/config.lua のエラーで、コマンドや終了の処理を止めない。
+-- 戻り値: 保存できたか (失敗はチャットで知らせる)
+local function save_settings()
+    local ok, err = pcall(config.save, settings)
+    if not ok then chat("[NMTimer] 設定を保存できませんでした (今回の起動中だけ有効です): " .. tostring(err), 123) end
+    return ok
+end
 
 local function stop()
     save_state()
-    config.save(settings)
+    save_settings()
     if hud then hud:hide() end
 end
 
 windower.register_event("logout", function()
-    seen_dead = {}
-    alive_seen = {}
-    alive_n = 0
+    logged_in = false                          -- 次の prerender で HUD を出し直さない・知らせを出さない・パケットを使わない
+    reset_observed()
     mark_returned()
     stop()
 end)
@@ -1022,7 +1420,7 @@ local function clear_for(e)
         end
     end
     recount_pending()
-    save_state()
+    return save_state(true)                    -- コマンドから呼ぶ: 失敗はその場で知らせる
 end
 
 local function need_entry(args, usage)
@@ -1180,26 +1578,31 @@ windower.register_event("addon command", function(cmd, ...)
             if cmd == "off" then
                 user.ignored[e.key] = true
                 clear_for(e)
-                chat(string.format("[NMTimer] %s の追跡をやめました。戻すには //nmt on %s", e.name, e.key))
+                local saved = save_user()
+                chat(string.format("[NMTimer] %s の追跡をやめました。戻すには //nmt on %s%s", e.name, e.key, unsaved_note(saved)))
             else
                 user.ignored[e.key] = nil
-                chat(string.format("[NMTimer] %s の追跡を再開しました。", e.name))
+                local saved = save_user()
+                chat(string.format("[NMTimer] %s の追跡を再開しました。%s", e.name, unsaved_note(saved)))
             end
-            save_user()
 
         elseif cmd == "tod" then
             local e, rest = need_entry(args, "//nmt tod <NM> [何分前]")
             if not e then return end
             local ago = (tonumber(rest[1]) or 0) * 60
-            record_kill(e, current_zone, nil, nil, nil, os.time() - ago)
+            if not finite(ago) or ago < 0 then        -- 負の値・無限大は、倒した時刻が未来になる
+                chat("[NMTimer] 何分前かは 0 以上の数で書いてください。 //nmt tod <NM> [何分前]", 123)
+                return
+            end
+            record_kill(e, current_zone, nil, nil, nil, os.time() - ago, true)
 
         elseif cmd == "time" then
             local e, rest = need_entry(args, "//nmt time <NM> <分> [最大分]")
             if not e then return end
             if rest[1] and rest[1]:lower() == "reset" then
                 user.times[e.key] = nil
-                save_user()
-                chat(string.format("[NMTimer] %s の時間を元に戻しました。", e.name))
+                local saved = save_user()
+                chat(string.format("[NMTimer] %s の時間を元に戻しました。%s", e.name, unsaved_note(saved)))
                 return
             end
             local min, max = tonumber(rest[1]), tonumber(rest[2])
@@ -1208,8 +1611,8 @@ windower.register_event("addon command", function(cmd, ...)
                 return
             end
             user.times[e.key] = {min = min, max = max and max > min and max or nil}
-            save_user()
-            chat(string.format("[NMTimer] %s の時間を %s にしました。", e.name, describe_wait(e)))
+            local saved = save_user()
+            chat(string.format("[NMTimer] %s の時間を %s にしました。%s", e.name, describe_wait(e), unsaved_note(saved)))
 
         elseif cmd == "add" then
             local name = target_name()
@@ -1225,9 +1628,9 @@ windower.register_event("addon command", function(cmd, ...)
             local e = {key = make_key(utf8_name(raw)), name = utf8_name(raw), alias = {raw}, kind = "timed",
                 zone_ids = {current_zone}, min = nums[1], max = nums[2], user = true}
             user.entries[#user.entries + 1] = e
-            save_user()
+            local saved = save_user()
             rebuild_index()
-            chat(string.format("[NMTimer] %s を追加しました(%s / %s)。倒れたら記録します。", e.name, zone_label(current_zone), describe_wait(e) or "時間不明"))
+            chat(string.format("[NMTimer] %s を追加しました(%s / %s)。倒れたら記録します。%s", e.name, zone_label(current_zone), describe_wait(e) or "時間不明", unsaved_note(saved)))
 
         elseif cmd == "alias" then
             local e = need_entry(args, "//nmt alias <NM>  (別名にしたい敵をターゲットしておく)")
@@ -1236,9 +1639,9 @@ windower.register_event("addon command", function(cmd, ...)
             if not name then chat("[NMTimer] 別名にする敵をターゲットしてください。", 123) return end
             user.alias[e.key] = user.alias[e.key] or {}
             table.insert(user.alias[e.key], name)
-            save_user()
+            local saved = save_user()
             rebuild_index()
-            chat(string.format("[NMTimer] %s の別名に「%s」を足しました。", e.name, utf8_name(name)))
+            chat(string.format("[NMTimer] %s の別名に「%s」を足しました。%s", e.name, utf8_name(name), unsaved_note(saved)))
 
         elseif cmd == "remove" then
             local e = need_entry(args, "//nmt remove <NM>")
@@ -1248,21 +1651,21 @@ windower.register_event("addon command", function(cmd, ...)
                 if ue.key == e.key then table.remove(user.entries, i) break end
             end
             clear_for(e)
-            save_user()
+            local saved = save_user()
             rebuild_index()
-            chat(string.format("[NMTimer] %s を消しました。", e.name))
+            chat(string.format("[NMTimer] %s を消しました。%s", e.name, unsaved_note(saved)))
 
         elseif cmd == "clear" then
             if #args == 0 then
                 state.records, state.ph_slots = {}, {}
                 recount_pending()
-                save_state()
-                chat("[NMTimer] 記録を全部消しました。")
+                local saved = save_state(true)
+                chat("[NMTimer] 記録を全部消しました。" .. unsaved_note(saved))
             else
                 local e = need_entry(args, "//nmt clear [NM]")
                 if not e then return end
-                clear_for(e)
-                chat(string.format("[NMTimer] %s の記録を消しました。", e.name))
+                local saved = clear_for(e)
+                chat(string.format("[NMTimer] %s の記録を消しました。%s", e.name, unsaved_note(saved)))
             end
 
         elseif cmd == "ph" then
@@ -1279,8 +1682,8 @@ windower.register_event("addon command", function(cmd, ...)
                 local e = need_entry({unpack(args, 2)}, "//nmt ph clear <NM>")
                 if not e then return end
                 user.ph_ids[e.key] = nil
-                save_user()
-                chat(string.format("[NMTimer] %s の PH の指定を全部消しました。近くで倒れた同じ名前の敵を数えます。", e.name))
+                local saved = save_user()
+                chat(string.format("[NMTimer] %s の PH の指定を全部消しました。近くで倒れた同じ名前の敵を数えます。%s", e.name, unsaved_note(saved)))
 
             elseif sub == "del" or sub == "remove" then
                 -- 倒れた敵はターゲットできないので、ID の数字でも指定できる (//nmt ph list や記録の知らせに ID が出る)
@@ -1305,10 +1708,10 @@ windower.register_event("addon command", function(cmd, ...)
                 end
                 user.ph_excluded[id] = true
                 ph_pending[id] = nil
-                save_user()
-                save_state()
+                local saved_user = save_user()
+                local saved = save_state(true) and saved_user
                 recount_pending()
-                chat(string.format("[NMTimer] ID %s を PH から外しました(記録と実測も消しました)。戻すには、その敵をターゲットして //nmt ph", id_tag(id)))
+                chat(string.format("[NMTimer] ID %s を PH から外しました(記録と実測も消しました)。戻すには、その敵をターゲットして //nmt ph%s", id_tag(id), unsaved_note(saved)))
 
             else
                 local t = target_mob()
@@ -1333,7 +1736,7 @@ windower.register_event("addon command", function(cmd, ...)
                     chat(string.format("[NMTimer] %s の PH に、この %s(ID %s)を加えました(指定は %d 体)。指定がある間は、指定した敵だけ数えます。",
                         e.name, utf8_name(t.name), id_tag(t.id), n))
                 end
-                save_user()
+                if not save_user() then chat("[NMTimer] " .. unsaved_note(false), 123) end
             end
 
         elseif cmd == "scan" then
@@ -1344,8 +1747,8 @@ windower.register_event("addon command", function(cmd, ...)
             if not e then return end
             if rest[1] and rest[1]:lower() == "reset" then
                 user.ph_times[e.key] = nil
-                save_user()
-                chat(string.format("[NMTimer] %s の PH の再湧き時間を元に戻しました(実測があればそれを使います)。", e.name))
+                local saved = save_user()
+                chat(string.format("[NMTimer] %s の PH の再湧き時間を元に戻しました(実測があればそれを使います)。%s", e.name, unsaved_note(saved)))
                 return
             end
             local minutes = tonumber(rest[1])
@@ -1354,45 +1757,41 @@ windower.register_event("addon command", function(cmd, ...)
                 return
             end
             user.ph_times[e.key] = minutes
-            save_user()
-            chat(string.format("[NMTimer] %s の PH の再湧き時間を %s分にしました。", e.name, tostring(minutes)))
+            local saved = save_user()
+            chat(string.format("[NMTimer] %s の PH の再湧き時間を %s分にしました。%s", e.name, tostring(minutes), unsaved_note(saved)))
 
         elseif cmd == "lead" then
             local n = tonumber(args[1])
             if not n or n < 0 then chat(string.format("[NMTimer] 今は %d分前です。 //nmt lead <分>", settings.lead_min)) return end
             settings.lead_min = n
-            config.save(settings)
-            chat(string.format("[NMTimer] 出られる %d分前に知らせます。", n))
+            if save_settings() then chat(string.format("[NMTimer] 出られる %d分前に知らせます。", n)) end
 
         elseif cmd == "expire" then
             local n = tonumber(args[1])
             if not n or n < 0 then chat(string.format("[NMTimer] 今は %d分です。 //nmt expire <分>", settings.expire_min)) return end
             settings.expire_min = n
-            config.save(settings)
-            chat(string.format("[NMTimer] 出られるようになってから %d分で HUD から消します。", n))
+            if save_settings() then chat(string.format("[NMTimer] 出られるようになってから %d分で HUD から消します。", n)) end
 
         elseif cmd == "sound" or cmd == "chat" or cmd == "hud" or cmd == "coord" then
             local field = cmd == "hud" and "show" or cmd
             settings[field] = on_off(args[1] and args[1]:lower(), settings[field])
-            config.save(settings)
-            chat(string.format("[NMTimer] %s: %s", cmd, settings[field] and "オン" or "オフ"))
+            if save_settings() then chat(string.format("[NMTimer] %s: %s", cmd, settings[field] and "オン" or "オフ")) end
             last_hud_text = nil
 
         elseif cmd == "pos" and tonumber(args[1]) and tonumber(args[2]) then
             settings.pos.x, settings.pos.y = tonumber(args[1]), tonumber(args[2])
             hud:pos(settings.pos.x, settings.pos.y)
-            config.save(settings)
+            save_settings()
 
         elseif cmd == "size" and tonumber(args[1]) then
             local size = math.max(6, math.min(40, tonumber(args[1])))
             settings.text.size = size
             hud:size(size)
-            config.save(settings)
+            save_settings()
 
         elseif cmd == "debug" then
             settings.debug = on_off(args[1] and args[1]:lower(), settings.debug)
-            config.save(settings)
-            chat(string.format("[NMTimer] debug: %s(倒れた敵の名前を表示します。別名を探すときに使います)", settings.debug and "オン" or "オフ"))
+            if save_settings() then chat(string.format("[NMTimer] debug: %s(倒れた敵の名前を表示します。別名を探すときに使います)", settings.debug and "オン" or "オフ")) end
 
         elseif cmd == "watch" then
             local wid = tonumber(args[1])
@@ -1416,6 +1815,10 @@ end)
 -- -----------------------------------------------------------------------------
 ensure_dir()
 update_zone()
+do
+    local info = windower.ffxi.get_info()
+    logged_in = info and info.logged_in and true or false
+end
 load_all()
 mark_returned()                                -- 読み込み直したり起動し直したあいだは見ていなかった
 recount_pending()
